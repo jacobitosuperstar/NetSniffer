@@ -226,3 +226,153 @@ doesn't hide the behavior we care about."
 Honest docs note: the histogram counts connections per host (via SNI/IP), not
 literal HTTP requests; ECH is the edge where identity collapses to IP. Everything
 else the rings measure is encryption-proof.
+
+---
+
+## 5. User
+
+> when using gopacket how do I know the device, being wifi or ethernet codes??
+
+## Claude
+
+On macOS the interface names (`en0`, `en1`, …) map to WiFi/Ethernet at the **OS
+level**, not through gopacket. `networksetup -listallhardwareports` prints the
+mapping. On this machine: **`en0` = Ethernet (wired)**, **`en1` = Wi-Fi**.
+
+But the name/medium isn't what matters for a sniffer — what matters is the
+interface **currently carrying traffic**, i.e. the one owning the **default route**.
+`route -n get default` reports it; here that's **`en1`** (Wi-Fi, `192.168.1.5`,
+status active). If Wi-Fi drops and Ethernet is plugged in, the default route moves
+to `en0` and that becomes the right device.
+
+- Don't hard-code WiFi-vs-Ethernet. Pick the interface that's up with a routable
+  IPv4 / owns the default route. In gopacket, `pcap.FindAllDevs()` returns the same
+  list (`.Name`, `.Addresses`); simplest is to let the user pass `-i en1` and only
+  auto-detect otherwise.
+- Parsing note: whether Wi-Fi or wired, macOS hands the capture **Ethernet-framed**
+  packets (`LinkTypeEthernet`) in normal mode — not raw 802.11 — so decoding is
+  identical either way. WiFi/Ethernet is a device-*selection* concern only.
+
+---
+
+## 6. User
+
+> and what happens if I have wifi and ethernet on??
+
+## Claude
+
+Both can be **up** at once, but macOS routes internet traffic over exactly **one**
+of them — chosen by **Service Order** priority (usually Ethernet over Wi-Fi), not by
+both being on. The winner gets the default route; the other keeps its IP but sits
+idle for internet-bound traffic.
+
+- A pcap handle captures **one** interface only. Sniff the wrong (idle) NIC and you
+  see almost nothing. Bind to the default-route interface.
+- macOS has **no working `any` pseudo-device** (Linux-only), so capturing all
+  interfaces at once means opening multiple handles and merging — likely out of
+  scope. Pick the default-route interface and note it as a limitation.
+
+---
+
+## 7. User
+
+> so when I call route -n get default I will get the one through which we are
+> sending all the traffic??
+
+## Claude
+
+Yes — it returns the interface owning the **default route**, where all
+*internet-bound* traffic goes. When both NICs are up, macOS picks one by Service
+Order and that's what the command reports. Two caveats:
+
+1. It's the default route, not literally *all* traffic. More-specific routes go
+   elsewhere: same-subnet/LAN traffic, VPN routes (`utun*` — this box has `utun8`),
+   multicast/link-local. Bulk internet traffic follows the default; those carve-outs
+   don't. A pcap handle on the default interface won't see VPN or same-subnet traffic.
+2. A pcap handle is bound to one interface — if the route later moves (unplug
+   Ethernet → Wi-Fi), a long-running capture stays on the old NIC and goes quiet.
+
+Shape: resolve the default-route interface at startup (or `-i` override), open the
+handle, document "captures the default-route interface; VPN/same-subnet excluded."
+
+---
+
+## 8. User
+
+> how do I get the default interface in gopacket?
+
+## Claude
+
+**gopacket doesn't have a "default interface" call — and neither does libpcap;**
+libpcap has no concept of the default route. gopacket gives you only:
+- `pcap.FindAllDevs()` → list interfaces (`.Name`, `.Addresses`, `.Flags`)
+- `pcap.OpenLive("en1", snaplen, promisc, timeout)` → open **one, by name**
+
+(The old `pcap_lookupdev` just returns the first up, non-loopback device — often
+wrong, e.g. `en0` when traffic is on `en1`. Don't use it.)
+
+Pattern: **resolve the default-route interface via the OS/Go stdlib, then pass the
+name to `pcap.OpenLive`.** The clean, dependency-free, no-privilege way is the
+"UDP dial" trick — the kernel does the route lookup and **sends nothing**:
+
+```go
+// 1. Which local IP would the default route use? (UDP Dial binds + routes; no packet sent)
+conn, _ := net.Dial("udp", "8.8.8.8:80")
+defer conn.Close()
+localIP := conn.LocalAddr().(*net.UDPAddr).IP   // -> 192.168.1.5
+
+// 2. Match that IP back to an interface name.
+ifaces, _ := net.Interfaces()
+for _, ifi := range ifaces {
+    addrs, _ := ifi.Addrs()
+    for _, a := range addrs {
+        if ipn, ok := a.(*net.IPNet); ok && ipn.IP.Equal(localIP) {
+            device := ifi.Name   // -> "en1"
+        }
+    }
+}
+// 3. handle, _ := pcap.OpenLive(device, 65536, true, pcap.BlockForever)
+```
+
+`8.8.8.8` need not be reachable; no traffic is generated — it's the same answer
+`route -n get default` gives, from inside Go. (Design guidance, not `network.go` —
+wiring it in is the user's part.)
+
+- Alternatives: `golang.org/x/net/route` reads the BSD/macOS routing table directly
+  (more correct for weird multi-route setups); `github.com/jackpal/gateway` is a tiny
+  lib. UDP-dial is the standard simplest choice here.
+- Keep the `-i` override: auto-detect when nothing is given, but let `-i en0` force a
+  device — handy for testing and it sidesteps every routing edge case.
+
+---
+
+## 9. User
+
+> what is a good snaplen?
+
+## Claude
+
+Two forces pull in opposite directions:
+
+1. **Byte accounting does NOT need a big snaplen.** snaplen truncates *captured*
+   bytes, but libpcap still reports the packet's **original on-wire length** in the
+   metadata — gopacket's `ci.Length` (original) vs `ci.CaptureLength` (truncated).
+   Per-host byte totals (the exfil/download signal) must read `ci.Length`, so they
+   stay accurate no matter how small snaplen is. Never capture payload just to count it.
+2. **Field parsing (SNI / HTTP Host) is the only reason to go bigger.** IP+TCP/UDP
+   headers are ~40–60 bytes; HTTP `Host:` is within a few hundred. **TLS SNI is the
+   demanding one** — it's an extension inside the ClientHello, and modern
+   ClientHellos run **1200–2000 bytes** (post-quantum key share now default in
+   Chrome/Firefox), occasionally spanning two segments. A 256/512 snaplen can
+   silently clip SNI and lose the hostname.
+
+Recommendation:
+- **Default `65536`** ("whole packet") — never truncates SNI/Host; extra copying is
+  negligible for one machine over a few seconds. (tcpdump defaults to `262144` for
+  the same reason.) Start here.
+- **To trim overhead: `~1600`** — one full Ethernet frame (max ≈1514); catches every
+  single-packet ClientHello and full HTTP request. Don't go below ~512 if SNI matters.
+- **Never pass `0`** — version-dependent (some libpcap builds capture nothing). Use
+  an explicit positive value.
+- Keep byte counting on `ci.Length`, which is what lets snaplen shrink without
+  undercounting volume.

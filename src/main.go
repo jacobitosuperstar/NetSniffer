@@ -52,24 +52,41 @@ func config_init(logPath string, time_window int, output string) Config {
 
 // worker This is where the code runs
 func worker(ctx context.Context, config *Config) error {
-	ticker := time.NewTimer(time.Second)
-	defer ticker.Stop()
+	const (
+		device = "en1" // this is my default interface on this machine (MacOS)
+		filter = "tcp port 80"
+	)
 
+	packets, handle, err := pkt_capture(device, filter)
+	if err != nil {
+		return err
+	}
+	defer handle.Close()
+
+	count := 0
 	for {
 		select {
 		case <-ctx.Done():
 			if ctx.Err() == context.DeadlineExceeded {
 				config.logger.Info(
 					"All the time has passed",
-					"time", config.timeWindow,
+					"time (seconds)", config.timeWindow,
+					"packets", count,
 				)
 				return nil
 			}
+			config.logger.Info("Process Interrumped", "packets", count)
 			return ctx.Err()
-		case t := <-ticker.C:
+		case pkt, ok := <-packets:
+			if !ok {
+				config.logger.Info("Closed source", "packets", count)
+				return nil
+			}
+			_ = pkt // Nothing to do here
+			count += 1
 			config.logger.Info(
-				"time passed",
-				"time", t,
+				"just running brother",
+				"packtes", count,
 			)
 		}
 	}
