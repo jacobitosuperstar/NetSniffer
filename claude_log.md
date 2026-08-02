@@ -376,3 +376,104 @@ Recommendation:
   an explicit positive value.
 - Keep byte counting on `ci.Length`, which is what lets snaplen shrink without
   undercounting volume.
+
+---
+
+## 10. User
+
+> reading the documentation, the packet object has something like a Layer which,
+> for my understanding, was the traffic layer that we are trying to see. When do I
+> use something like application layer vs tcp layer and so on
+
+## Claude
+
+Every `gopacket.Packet` decodes into a **stack of layers**, one per protocol level.
+Two ways to reach a layer:
+- **By role (abstract):** `LinkLayer()`, `NetworkLayer()`, `TransportLayer()`,
+  `ApplicationLayer()` — return interfaces, so code works across IPv4/IPv6 or TCP/UDP
+  without caring which concrete protocol. Use when you want "the L3/L4 thing" generically.
+- **By protocol (concrete):** `packet.Layer(layers.LayerTypeTCP)` → assert to
+  `*layers.TCP`. Use when you need protocol-specific fields (flags, TTL).
+
+OSI mapping:
+
+| Accessor | OSI | Concrete type | Gives you |
+|---|---|---|---|
+| `LinkLayer()` | L2 | `*layers.Ethernet` | MAC addrs — rarely needed |
+| `NetworkLayer()` | L3 | `*layers.IPv4`/`IPv6` | src/dst IP |
+| `TransportLayer()` | L4 | `*layers.TCP`/`UDP` | ports, TCP flags |
+| `ApplicationLayer()` | L5–7 | raw payload bytes | HTTP request, TLS ClientHello (SNI) |
+
+"Application layer" isn't a protocol — it's the catch-all **payload above transport**.
+
+**Which layer answers which question (not either/or — one packet has all):**
+- Host identity (dest IP) + direction → `NetworkLayer()` (`SrcIP`/`DstIP` vs own IPs);
+  `packet.NetworkFlow()` for the endpoint pair.
+- Port 80/443? new connection? → `TransportLayer()` / `*layers.TCP` for
+  `SrcPort`/`DstPort` and the **SYN flag** (SYN = new flow → connection increment).
+- Bytes per host → *no layer* — `packet.Metadata().Length` (original on-wire size).
+- SNI / HTTP Host → `ApplicationLayer().Payload()`, parse the bytes yourself.
+
+Rule of thumb: **transport = the envelope** (who/port/state), **application = the
+contents** (hostname).
+
+**Three gotchas:**
+1. `ApplicationLayer()` is **nil** for payload-less packets (ACK/SYN/FIN) — nil-check.
+   Flow accounting (counts/bytes/direction) is L3/L4 and works on those anyway.
+2. The app layer is **raw bytes** — gopacket does not auto-decode HTTP/TLS; parse
+   the ClientHello / request line yourself.
+3. App data can **span multiple TCP segments** — one packet's payload may be a
+   fragment. SNI is usually in the first data packet (grab directly), but fully
+   correct needs the `reassembly` package. Skip it and document as a limitation.
+
+This is why the design is "flow monitor, not HTTP parser": most packets only touch
+L3/L4 (cheap, always present, encryption-proof); dip into the application layer
+**only on the first packet of a flow** to grab the hostname.
+
+---
+
+## 11. User
+
+> question, are network calls sequential in this case or do we have to use go
+> routines for us to catch what is happening over the network?? or is better to use
+> a new goroutine for each BPF filter that we are going to apply??
+
+## Claude
+
+**Do NOT run a goroutine/handle per BPF filter — that's the anti-pattern.** A pcap
+handle carries exactly one BPF program. N handles with N filters on one interface
+capture that NIC N times into N buffers → **double-count** overlapping packets,
+wreck byte accounting, waste CPU. BPF's job is to cheaply drop irrelevant packets
+in-kernel, **not** to split traffic.
+- **One handle, one BPF filter = the union** (`tcp port 80 or tcp port 443 or udp
+  port 443`). **Demultiplex in userspace** — a cheap `if` on ports/payload routes
+  each packet to the right counter. Multiple *interfaces* are the only reason for
+  multiple handles.
+
+**Reads are sequential — one handle is a sequential stream.** Loop with
+`handle.ReadPacketData()` or `range` over `PacketSource.Packets()`. You do NOT miss
+bursts while processing: the kernel's **BPF ring buffer** absorbs them. You only drop
+if processing is *persistently* slower than arrival — measurable via `handle.Stats()`
+(`PacketsDropped`). That counter is ground truth for "am I keeping up."
+
+**Goroutines aren't needed for correctness — start single-threaded.** Per-packet work
+is O(1) (increment a Space-Saving counter); one goroutine (read → classify →
+increment) keeps up and, crucially, **touches the counters from one goroutine → no
+locks**, keeping eviction logic simple.
+
+Goroutines earn their place for two *specific* reasons:
+1. **Decouple capture from processing** — only if `Stats()` shows drops: capture
+   goroutine drains handle → buffered channel → **one** worker. Multi-worker forces a
+   mutex/sharding on the counters; avoid unless profiling demands it.
+2. **Clean timed shutdown** — interacts with the existing `ctx` timeout.
+
+**Shutdown gotcha:** `PacketSource.Packets()` blocks on its channel and won't unblock
+when `ctx` expires. Either (a) run capture in its own goroutine and call
+`handle.Close()` on `<-ctx.Done()` to unblock the read, or (b) set a **finite read
+timeout** in `OpenLive` (e.g. 100ms) and re-check `ctx.Err()` each iteration. Avoid
+`pcap.BlockForever` for a time-bounded tool unless closing the handle elsewhere — a
+quiet network means the loop never wakes to notice the deadline.
+
+**Net:** one handle, one union BPF filter, one capture goroutine owning the counters
+(no locks), deadline-driven `handle.Close()` for shutdown. Add the
+capture→channel→worker split only if `Stats()` proves drops.

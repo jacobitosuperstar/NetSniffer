@@ -22,7 +22,7 @@ type Config struct {
 // config_init Initializes the configuration object returning a Config struct
 // that contains the timeWindow of operation and the logger. This panics if
 // we cannot open the file on which we are going to write the logs.
-func config_init(logPath string, time_window int, output string) Config {
+func NewConfig(logPath string, time_window int, output string) Config {
 	// log file
 	var logOut io.Writer
 	switch output {
@@ -52,6 +52,9 @@ func config_init(logPath string, time_window int, output string) Config {
 
 // worker This is where the code runs
 func worker(ctx context.Context, config *Config) error {
+	// start the count!!!!!!!
+	counter := NewCounter()
+
 	const (
 		device = "en1" // this is my default interface on this machine (MacOS)
 		filter = "tcp port 80"
@@ -63,7 +66,6 @@ func worker(ctx context.Context, config *Config) error {
 	}
 	defer handle.Close()
 
-	count := 0
 	for {
 		select {
 		case <-ctx.Done():
@@ -71,22 +73,22 @@ func worker(ctx context.Context, config *Config) error {
 				config.logger.Info(
 					"All the time has passed",
 					"time (seconds)", config.timeWindow,
-					"packets", count,
+					"traffic", counter.total,
 				)
+				fmt.Println(counter)
 				return nil
 			}
-			config.logger.Info("Process Interrumped", "packets", count)
+			config.logger.Info("Process Interrumped", "traffic", counter.total)
 			return ctx.Err()
 		case pkt, ok := <-packets:
 			if !ok {
-				config.logger.Info("Closed source", "packets", count)
+				config.logger.Info("Closed source", "traffic", counter.total)
 				return nil
 			}
-			_ = pkt // Nothing to do here
-			count += 1
+			counter.count(pkt) // Nothing to do here
 			config.logger.Info(
 				"just running brother",
-				"packtes", count,
+				"traffic", counter.total,
 			)
 		}
 	}
@@ -112,7 +114,7 @@ func run(argv []string) error {
 	duration := time.Duration(*seconds) * time.Second
 
 	// for development we will spit everything to stdout
-	config := config_init(*logPath, *seconds, "stdout")
+	config := NewConfig(*logPath, *seconds, "stdout")
 
 	// OS signals
 	ctx, stop := signal.NotifyContext(

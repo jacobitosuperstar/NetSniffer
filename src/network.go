@@ -18,7 +18,8 @@ func pkt_capture(
 	error,
 ) {
 	const (
-		snaplen     = 1600  // 1518 is the standard ethernet frame
+		// snaplen     = 1600  // 1518 is the standard ethernet frame
+		snaplen     = 65535 // full payload capture
 		promiscuous = false // we only care about traffic in our device
 	)
 
