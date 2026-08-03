@@ -541,3 +541,83 @@ bolt on reassembly + `http.ReadRequest` **only for cleartext HTTP**. For the gra
 minimum, decide explicitly — "requests" as precise cleartext HTTP requests → assembler;
 "requests" redefined as connections/flows per host (HTTPS framing) → skip reassembly,
 count flows. Document the choice.
+
+---
+
+## 13. User
+
+> could you help me create a bash script that calls 20 websites, among them,
+> http://jacobobedoya.com, http://jacobitosuperstar.codeberg.page/DependaMan/en/,
+> http://jacobitosuperstar.codeberg.page/HandyMan/en/, and others that you may find
+> useful for the test. Call them concurrently so we can know that the tcp assembler
+> that I created works correctly and all of that. Display it, don't write the file.
+
+## Claude
+
+Provided a **test-harness** script (exercises the sniffer, so it's on the "tests"
+side of the ground rule — not product code). Displayed only, not written.
+
+```bash
+#!/usr/bin/env bash
+# generate_traffic.sh — fire ~20 concurrent cleartext-HTTP requests at a mix of
+# hosts to exercise NetSniffer's capture loop + TCP reassembler. Test harness only.
+#   sudo ./NetSniffer -i en1 -seconds 20 -log /tmp/sniff.log   # start first
+set -u
+UA="NetSnifferTest/1.0"
+CURL=(curl --silent --show-error --http1.1 --user-agent "$UA"
+      --connect-timeout 8 --max-time 20 --output /dev/null
+      --write-out "[%{http_code}] %{url_effective} -> %{remote_ip} (%{size_download}B, %{num_connects} new-conn, %{time_total}s)\n")
+requests=(
+  "http://jacobobedoya.com"
+  "http://jacobobedoya.com"
+  "http://jacobitosuperstar.codeberg.page/DependaMan/en/"
+  "http://jacobitosuperstar.codeberg.page/HandyMan/en/"
+  "http://jacobitosuperstar.codeberg.page/"
+  "http://neverssl.com"
+  "http://neverssl.com"
+  "http://httpforever.com"
+  "http://info.cern.ch"
+  "http://example.com"
+  "http://example.com"
+  "http://example.org"
+  "http://example.net"
+  "http://www.gnu.org"
+  "http://ftp.gnu.org/gnu/bash/"
+  "http://httpbin.org/get"
+  "http://httpbin.org/headers"
+  "http://httpbin.org/bytes/40000"   # 40 KB response -> spans many TCP segments
+)
+pids=()
+for u in "${requests[@]}"; do "${CURL[@]}" "$u" & pids+=($!); done
+# SPECIAL 1 — keep-alive: 3 requests over ONE TCP connection (tests request-boundary
+# counting via http.ReadRequest loop, not connection counting).
+curl --silent --show-error --http1.1 -A "$UA" \
+     -o /dev/null http://httpbin.org/get \
+     -o /dev/null http://httpbin.org/user-agent \
+     -o /dev/null http://httpbin.org/ip \
+     -w "[keep-alive x3] last=%{url_effective} total-new-conns=%{num_connects}\n" &
+pids+=($!)
+# SPECIAL 2 — ~50 KB POST body (tests reassembly of the client->server request stream
+# across multiple TCP segments before Content-Length bytes can be consumed).
+"${CURL[@]}" --request POST --data-binary @<(yes A | head -c 50000) \
+     http://httpbin.org/post &
+pids+=($!)
+wait
+```
+
+**Rationale, mapped to the design:**
+- **Concurrency (`&`+`wait`)** — ~20 flows interleave at the capture loop; the real
+  test of demux-by-5-tuple (packets arrive in capture order, must sort into per-flow
+  buffers).
+- **Repeated hosts** (codeberg ×3, jacobobedoya ×2, neverssl ×2, example.com ×2,
+  httpbin ×5-ish) → non-trivial, checkable top-10 histogram ranking.
+- **Special 1 (keep-alive)** — separates a correct request counter (reports 3 via
+  `http.ReadRequest` loop) from a naive one (counts SYNs → 1). `num_connects` confirms
+  socket reuse.
+- **Special 2 (50 KB POST)** — forces the request body across TCP segments → the
+  multi-segment client→server reassembly path a GET never hits.
+- `--http1.1` keeps traffic on HTTP/1.x (what the parser handles). `%{remote_ip}` /
+  `%{num_connects}` give ground truth to diff against sniffer output.
+
+Caveats: **port 80 intentional** (drives the cleartext/assembler path; 301→HTTPS
+still makes a captured port-80 request). Run on **en1** (default route) with `sudo`.
