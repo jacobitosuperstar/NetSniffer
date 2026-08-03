@@ -29,6 +29,8 @@ type Config struct {
 func NewConfig(logPath string, time_window int, output string) Config {
 	// log file
 	var logOut io.Writer
+	// This only exists as for debug porpuses I want to see everything on
+	// console and not in log file.
 	switch output {
 	case "stdout":
 		logOut = os.Stdout
@@ -45,7 +47,7 @@ func NewConfig(logPath string, time_window int, output string) Config {
 	}
 	// options for the logger
 	options := &slog.HandlerOptions{
-		Level:     slog.LevelInfo,
+		Level:     slog.LevelDebug,
 		AddSource: true,
 	}
 	handler := slog.NewTextHandler(logOut, options)
@@ -55,11 +57,12 @@ func NewConfig(logPath string, time_window int, output string) Config {
 }
 
 // worker This is where the code runs
-func worker(ctx context.Context, config *Config) error {
+func worker(ctx context.Context, config *Config, device string, filter string) error {
 	const (
-		device    = "en1" // this is my default interface on this machine (MacOS)
-		filter    = "tcp port 80"
-		idleTimer = 1 // minutes
+		// device      = "en1"             // this is my default interface on this machine (MacOS)
+		// filter      = "tcp dst port 80" //only destination
+		flushTicker = 60 //seconds
+		idleTimer   = 60 // seconds
 	)
 
 	packets, handle, err := pkt_capture(device, filter)
@@ -80,7 +83,7 @@ func worker(ctx context.Context, config *Config) error {
 
 	// We will check which connections are idle for too lond and send them to
 	// the reader. A slow connection cannot hang forever.
-	flush := time.NewTicker(time.Minute)
+	flush := time.NewTicker(flushTicker * time.Second)
 	defer flush.Stop()
 
 	for {
@@ -91,8 +94,27 @@ func worker(ctx context.Context, config *Config) error {
 			assembler.FlushAll()
 			wg.Wait()
 
-			if ctx.Err() == context.DeadlineExceeded {
+			// MISSING PACKETS REPORT
+			// We are doing best effor + report to check correctness, haven't
+			// found the limit for our code that makes us drop packets.
+			if stats, err := handle.Stats(); err == nil {
 				config.logger.Info(
+					"capture stats",
+					"received", stats.PacketsReceived,
+					"kernel_dropped", stats.PacketsDropped,
+					"iface_dropped", stats.PacketsIfDropped,
+				)
+				if dropped := stats.PacketsDropped + stats.PacketsIfDropped; dropped > 0 {
+					fmt.Fprintf(
+						os.Stdout,
+						"WARNING: %d packets dropped during capture — request counts may be undercounted\n",
+						dropped,
+					)
+				}
+			}
+
+			if ctx.Err() == context.DeadlineExceeded {
+				config.logger.Debug(
 					"All the time has passed",
 					"time (seconds)", config.timeWindow,
 					"traffic", counter.total,
@@ -101,14 +123,23 @@ func worker(ctx context.Context, config *Config) error {
 				counter.PrettyRanking(os.Stdout)
 				return nil
 			}
-			config.logger.Error("Process Interrumped", "traffic", counter.total)
+			config.logger.Info("Process interrupted", "traffic", counter.total)
 			// FINAL REPORT INTO THE CONSOLE
 			counter.PrettyRanking(os.Stdout)
-			return ctx.Err()
+			return nil
 		case <-flush.C:
+			// LIFE SIGNAL
+			// TODO @jacobo: complete waste of resources, this lives just for
+			// the test. Talk about performance and destroy this.
+			total, hosts := counter.View()
+			config.logger.Debug(
+				"just running brother",
+				"total traffic", total,
+				"hosts", hosts,
+			)
 			// if the connection is alive for more than X time, send it to the
 			// reader already.
-			assembler.FlushOlderThan(time.Now().Add(-(idleTimer) * time.Minute))
+			assembler.FlushOlderThan(time.Now().Add(-(idleTimer) * time.Second))
 		case pkt, ok := <-packets:
 			if !ok {
 				assembler.FlushAll()
@@ -140,13 +171,6 @@ func worker(ctx context.Context, config *Config) error {
 				tcp,
 				pkt.Metadata().Timestamp,
 			)
-
-			total, hosts := counter.View()
-			config.logger.Debug(
-				"just running brother",
-				"total traffic", total,
-				"hosts", hosts,
-			)
 		}
 	}
 }
@@ -156,6 +180,10 @@ func run(argv []string) error {
 	fs := flag.NewFlagSet("main", flag.ContinueOnError)
 	logPath := fs.String("log", "", "path to the log file")
 	seconds := fs.Int("seconds", 0, "how long the program runs (seconds)")
+
+	// TODO @jacobo: With more time this should be in the configuration struct
+	device := fs.String("device", "en1", "network interface to capture on") //MacOS en1 -> wifi
+	filter := fs.String("BPF", "tcp dst port 80", "BPF capture filter")
 
 	if err := fs.Parse(argv); err != nil {
 		return err
@@ -171,7 +199,7 @@ func run(argv []string) error {
 	duration := time.Duration(*seconds) * time.Second
 
 	// for development we will spit everything to stdout
-	config := NewConfig(*logPath, *seconds, "stdout")
+	config := NewConfig(*logPath, *seconds, "")
 
 	// OS signals
 	ctx, stop := signal.NotifyContext(
@@ -185,11 +213,13 @@ func run(argv []string) error {
 	ctx, stop = context.WithTimeout(ctx, duration)
 	defer stop()
 
-	if err := worker(ctx, &config); err != nil {
+	// I AM TIRED BOSS
+	// we are allowed to some yank right now.
+	if err := worker(ctx, &config, *device, *filter); err != nil {
 		config.logger.Error("Error running the worker", "error", err)
 		return err
 	}
-	config.logger.Info("Finished")
+	config.logger.Debug("Finished")
 	return nil
 }
 

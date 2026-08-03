@@ -6,9 +6,12 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"math"
 	"net/http"
 	"slices"
+	"strings"
 	"sync"
+	"text/tabwriter"
 
 	"github.com/gopacket/gopacket"
 	"github.com/gopacket/gopacket/tcpassembly"
@@ -83,13 +86,30 @@ func (counter *HttpCounter) Ranking() (int, []HostCount) {
 func (counter *HttpCounter) PrettyRanking(w io.Writer) {
 	total, hosts := counter.Ranking()
 
-	fmt.Fprintf(w, "\nTotal of HTTP 1.X requests: %d\n", total)
+	fmt.Fprintf(w, "\nTotal of HTTP 1.X requests: %d\n\n", total)
 
-	fmt.Fprintln(w, "Rank\tHost\tRequests")
+	// IT'S TABLE TIME
+	// Making the drawing rules
+	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
 
+	// HEADER
+	fmt.Fprintln(tw, "Rank\tHost\tRequests\tStars")
+
+	const maxStars = 10
+	maxCount := hosts[0].Count
+
+	// BODY
 	for i := 0; i < len(hosts); i++ {
-		fmt.Fprintf(w, "%d\t%s\t%d\n", i+1, hosts[i].Host, hosts[i].Count)
+		// in the example I saw a round up
+		stars := int(math.Ceil(float64(hosts[i].Count) / float64(maxCount) * maxStars))
+		fmt.Fprintf(
+			tw,
+			"%d\t%s\t%d\t%s\n",
+			i+1, hosts[i].Host, hosts[i].Count, strings.Repeat("*", stars),
+		)
 	}
+
+	tw.Flush()
 }
 
 // ConsumerStream Called by the reader. Here we will create the byte stream
@@ -128,6 +148,9 @@ func (c_stream *ConsumerStream) register() {
 		// we will discard the request object, better to store somewhere the
 		// host name.
 		host := request.Host
+		if host == "" {
+			host = "(unknown)"
+		}
 
 		// TODO @jacobo: I don't know if we would like to track the size of the
 		// bodies. But here is where we would pick up the body size.
