@@ -32,6 +32,10 @@ root, so the binary is always run under `sudo` (see below).
 
 Recording of a local test run:
 
+https://github.com/user-attachments/assets/e16df8f9-8246-43e9-8422-034928c060f0
+
+
+
 ### INTERNET TEST
 
 - Terminal A: `sudo ./NetSniffer -log /tmp/sniff.log -seconds 20` it can also
@@ -39,6 +43,11 @@ Recording of a local test run:
 - Terminal B: `bash test.sh`
 
 Recording of an internet test run:
+
+
+https://github.com/user-attachments/assets/4f41d4d3-405e-430a-b1c6-e6f851feaf4b
+
+
 
 ## HOW IT WAS BUILD
 
