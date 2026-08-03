@@ -477,3 +477,67 @@ quiet network means the loop never wakes to notice the deadline.
 **Net:** one handle, one union BPF filter, one capture goroutine owning the counters
 (no locks), deadline-driven `handle.Close()` for shutdown. Add the
 capture→channel→worker split only if `Stats()` proves drops.
+
+---
+
+## 12. User
+
+> question, when I receive packets I know that they are sequential, but they don't
+> have to be ordered, as we may have different sequential packets from different
+> sources. How do I stitch together the full body of a request??
+
+## Claude
+
+This is **TCP reassembly** — "sequential in capture order" ≠ "ordered within a
+conversation." It decomposes into three operations:
+1. **Demux by connection** — group by 5-tuple; interleaving across flows is solved by
+   keying on the tuple.
+2. **Order within a connection by TCP sequence number** — not capture order; resolves
+   retransmits/reordering/gaps.
+3. **Concatenate in-order payloads** into a byte stream, then parse app data off it.
+
+Crucially there are **two half-streams per connection** (client→server,
+server→client), ordered independently; the request body is the client→server one.
+
+**Don't hand-roll it** — seq numbers wrap at 2³², overlaps/partial retransmits are
+subtle, mistakes silently corrupt payloads. gopacket ships it. Confirmed present in
+v1.7.0:
+- **`gopacket/reassembly`** — modern: `Assembler` + `StreamPool` + your
+  `StreamFactory`/`Stream`; handles direction, overlaps, gaps, memory bounds
+  (`MaxBufferedPagesPerConnection`, `MaxBufferedPagesTotal`). **Use this.**
+- **`gopacket/tcpassembly` + `.../tcpreader`** — older, but `tcpreader.ReaderStream`
+  turns a reassembled stream into a plain `io.Reader`.
+
+**Mechanism:** feed every TCP packet via
+`assembler.AssembleWithContext(packet.NetworkFlow(), tcp, ctx)`. The assembler orders
+per half-connection and calls your `Stream.ReassembledSG(sg, ac)` with contiguous
+in-order bytes; `StreamFactory.New` fires once per new connection for per-flow state.
+
+**HTTP idiom** — wrap the reassembled stream as `io.Reader`
+(`tcpreader.ReaderStream`), `bufio.NewReader`, then loop `http.ReadRequest`. Each
+successful parse = **one request** (pull `req.Host`/`Method`/`URL.Path`). This is the
+*only* accurate way to count "number of HTTP requests" over **HTTP/1.1
+keep-alive/pipelining**, where one connection carries many requests — SYN/packet
+counts can't.
+
+**Gotchas = the DoS story** (reassembly is stateful, per-connection):
+- **Gaps** (dropped/uncaptured segment, or capture started mid-connection) → skip and
+  accept partial.
+- **Half-open/never-closed connections leak memory** → must periodically
+  `assembler.FlushCloseOlderThan(cutoff)`.
+- **Attacker forces buffering with seq holes** (send byte 1000, withhold 0–999) →
+  memory-exhaustion vector; bound with `MaxBufferedPagesPerConnection`/`...Total`. The
+  reassembly-layer analogue of the bounded-memory histogram argument.
+
+**Judgment call for this tool:** reassembly is needed **only** for the cleartext-HTTP
+content path (full parsing + accurate keep-alive request counts). NOT needed for the
+signals the design leans on:
+- **SNI** → first ClientHello segment, grab from one packet (reassemble only to
+  survive split ClientHellos, rare).
+- **Flow counts / bytes / direction** → per-packet metadata, no reassembly.
+
+So: flow/byte/SNI path stays **stateless and cheap** (every packet, encryption-proof);
+bolt on reassembly + `http.ReadRequest` **only for cleartext HTTP**. For the graded
+minimum, decide explicitly — "requests" as precise cleartext HTTP requests → assembler;
+"requests" redefined as connections/flows per host (HTTPS framing) → skip reassembly,
+count flows. Document the choice.

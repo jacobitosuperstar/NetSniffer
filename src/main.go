@@ -8,8 +8,12 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
+
+	"github.com/gopacket/gopacket/layers"
+	"github.com/gopacket/gopacket/tcpassembly"
 )
 
 // Config stores the logging configuration and the time window on which the
@@ -41,7 +45,7 @@ func NewConfig(logPath string, time_window int, output string) Config {
 	}
 	// options for the logger
 	options := &slog.HandlerOptions{
-		Level:     slog.LevelDebug,
+		Level:     slog.LevelInfo,
 		AddSource: true,
 	}
 	handler := slog.NewTextHandler(logOut, options)
@@ -52,12 +56,10 @@ func NewConfig(logPath string, time_window int, output string) Config {
 
 // worker This is where the code runs
 func worker(ctx context.Context, config *Config) error {
-	// start the count!!!!!!!
-	counter := NewCounter()
-
 	const (
-		device = "en1" // this is my default interface on this machine (MacOS)
-		filter = "tcp port 80"
+		device    = "en1" // this is my default interface on this machine (MacOS)
+		filter    = "tcp port 80"
+		idleTimer = 1 // minutes
 	)
 
 	packets, handle, err := pkt_capture(device, filter)
@@ -66,29 +68,84 @@ func worker(ctx context.Context, config *Config) error {
 	}
 	defer handle.Close()
 
+	// start the count!!!!!!!
+	counter := NewCounter()
+	var wg sync.WaitGroup
+	asf := &AssemblerStreamFactory{
+		counter: counter,
+		wg:      &wg,
+	}
+	pool := tcpassembly.NewStreamPool(asf)
+	assembler := tcpassembly.NewAssembler(pool)
+
+	// We will check which connections are idle for too lond and send them to
+	// the reader. A slow connection cannot hang forever.
+	flush := time.NewTicker(time.Minute)
+	defer flush.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
+			// send everything to the reader and wait for them to be processed
+			// if possible.
+			assembler.FlushAll()
+			wg.Wait()
+
 			if ctx.Err() == context.DeadlineExceeded {
 				config.logger.Info(
 					"All the time has passed",
 					"time (seconds)", config.timeWindow,
 					"traffic", counter.total,
 				)
-				fmt.Println(counter)
+				// FINAL REPORT INTO THE CONSOLE
+				counter.PrettyRanking(os.Stdout)
 				return nil
 			}
-			config.logger.Info("Process Interrumped", "traffic", counter.total)
+			config.logger.Error("Process Interrumped", "traffic", counter.total)
+			// FINAL REPORT INTO THE CONSOLE
+			counter.PrettyRanking(os.Stdout)
 			return ctx.Err()
+		case <-flush.C:
+			// if the connection is alive for more than X time, send it to the
+			// reader already.
+			assembler.FlushOlderThan(time.Now().Add(-(idleTimer) * time.Minute))
 		case pkt, ok := <-packets:
 			if !ok {
+				assembler.FlushAll()
+				wg.Wait()
 				config.logger.Info("Closed source", "traffic", counter.total)
 				return nil
 			}
-			counter.count(pkt) // Nothing to do here
-			config.logger.Info(
+			netLayer := pkt.NetworkLayer()
+			transportLayer := pkt.TransportLayer()
+
+			// NOTE: Malformed packets can still pass the BPF offsets and
+			// validations as they don't check for content.
+			if netLayer == nil || transportLayer == nil {
+				config.logger.Warn("Malformed packet was here")
+				continue
+			}
+
+			// If this is a performance issue we can nuke this and just hope
+			// for the BPF to always work correctly.
+			tcp, ok := transportLayer.(*layers.TCP)
+			if !ok {
+				config.logger.Error("The BPF is not working correctly as only TCP connections should be here")
+				continue
+			}
+
+			// HANDOFF
+			assembler.AssembleWithTimestamp(
+				netLayer.NetworkFlow(),
+				tcp,
+				pkt.Metadata().Timestamp,
+			)
+
+			total, hosts := counter.View()
+			config.logger.Debug(
 				"just running brother",
-				"traffic", counter.total,
+				"total traffic", total,
+				"hosts", hosts,
 			)
 		}
 	}
